@@ -1,0 +1,8 @@
+#!/bin/sh
+# Run in tmux by claude-sandbox: resumes the conversation if there is one,
+# otherwise starts a new one. Arguments go to claude.
+cd "$SANDBOX_WORKDIR" || exit
+if ls "$CLAUDE_CONFIG_DIR"/projects/*/*.jsonl >/dev/null 2>&1; then
+  exec claude --continue "$@"
+fi
+exec claude "$@"

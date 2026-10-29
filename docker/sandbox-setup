@@ -1,0 +1,17 @@
+#!/usr/bin/env node
+// Run by `claude-sandbox new` after copying the template: marks onboarding,
+// bypass-permissions and workspace trust as accepted, so Claude starts
+// straight into a session.
+const fs = require("fs");
+const path = require("path");
+
+const file = path.join(process.env.CLAUDE_CONFIG_DIR, ".claude.json");
+const cfg = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+cfg.hasCompletedOnboarding = true;
+cfg.bypassPermissionsModeAccepted = true;
+cfg.projects ??= {};
+cfg.projects[process.env.SANDBOX_WORKDIR] = {
+  ...cfg.projects[process.env.SANDBOX_WORKDIR],
+  hasTrustDialogAccepted: true,
+};
+fs.writeFileSync(file, JSON.stringify(cfg, null, 2));

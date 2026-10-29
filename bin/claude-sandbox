@@ -1,0 +1,453 @@
+#!/bin/bash
+# Run Claude Code in persistent Docker containers. See the README for details.
+#
+# Usage: claude-sandbox COMMAND [ARGS]
+#
+#   new [NAME] [--isolate] [-- PROMPT]   Create a sandbox from a copy of this folder
+#   attach NAME                          Open Claude (Ctrl-b d or close the tab to leave)
+#   stop | start NAME                    Shut down / boot again and resume
+#   ls                                   List sandboxes
+#   rm [-f] NAME                         Delete a sandbox and everything in it
+#   net NAME [on|off]                    Show or switch internet access
+#   git NAME [on|off]                    Show or switch access to .git
+#
+# Run `claude-sandbox --help-more` for additional guidance
+#--more
+# Usage: claude-sandbox COMMAND [ARGS]
+#
+# Sandboxes
+#   new [NAME] [options] [-- claude args...]
+#       Create a sandbox from a copy of a folder and start Claude in it.
+#       NAME defaults to <folder>-sandbox-NN.
+#       --from DIR       Folder to copy in (default: current folder)
+#       --template T     Starting ~/.claude: a template name or a path
+#                        (default: default)
+#       --isolate        Start with git and internet off; can't be used with --mount
+#       --no-git         Start with git off
+#       --offline        Start with internet off
+#       --mount          Use the real folder live instead of a copy
+#       --cpus N         CPU limit (default 8)
+#       --memory SIZE    Memory limit, e.g. 4g (default 8g)
+#   attach NAME          Open Claude (Ctrl-b d or close the tab to leave)
+#   stop NAME            Shut down; files and conversation are kept
+#   start NAME           Boot again and resume the conversation
+#   ls                   List sandboxes
+#   rm [-f] NAME         Delete a sandbox and everything in it
+#
+# Access (switches live, without restarting Claude)
+#   net NAME [on|off]    Show or switch internet. Off allows only Anthropic's API
+#                        and the domains in ~/.config/claude-sandbox/allowlist
+#   net reload           Apply changes to the allowlist
+#   git NAME [on|off]    Show or switch access to .git (history, commits, pushes).
+#                        Off hides it where Claude can't read it
+#
+# Files
+#   import NAME PATH... [--to DIR]     Copy files or folders into the workspace
+#   export NAME [PATH...] [--to DIR]   Copy the workspace, or PATHs, out
+#                                      (default: ./NAME-export, must not exist)
+#   shell NAME                         Open a bash shell in the workspace
+#
+# Maintenance
+#   rebuild              Rebuild the image (updates Claude Code)
+set -euo pipefail
+
+image=claude-sandbox
+# The repo this script lives in (followed through the install symlink).
+repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# Your own templates, allowlist and, without the macOS Keychain, tokens.
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/claude-sandbox"
+
+# Sandboxes send web traffic to "proxy": an open proxy on the online network,
+# a filtering one on the offline network (which has no other route out).
+# Moving a sandbox between networks switches its internet without a restart.
+net_on=claude-sandbox-online
+net_off=claude-sandbox-offline
+proxy_image=claude-sandbox-proxy
+proxy_open=claude-sandbox-proxy
+proxy_filtered=claude-sandbox-proxy-offline
+proxy_url=http://proxy:8888
+
+die() { echo "claude-sandbox: $*" >&2; exit 1; }
+
+# Help is the comment block above: --help up to "#--more", --help-more after.
+usage() { sed -n '2,/^#--more/{/^#--more/d;s/^# \{0,1\}//;p;}' "$0"; }
+usage_more() { sed -n '/^#--more/,/^set -euo/{/^#--more/d;/^set -euo/d;s/^# \{0,1\}//;p;}' "$0"; }
+
+# Exports $1 from the Keychain item (macOS) or file (elsewhere) named $2,
+# unless it's already set in the environment.
+load_secret() {
+  local var=$1 item=$2 value=""
+  [[ -n "${!var:-}" ]] && return 0
+  if command -v security >/dev/null; then
+    value="$(security find-generic-password -a "$USER" -s "$item" -w 2>/dev/null)" || true
+  elif [[ -r "$config_dir/$item" ]]; then
+    value="$(<"$config_dir/$item")"
+  fi
+  [[ -n "$value" ]] && export "$var=$value"
+  return 0
+}
+
+ensure_image() {
+  docker image inspect "$image" >/dev/null 2>&1 || docker build --pull -t "$image" "$repo_dir/docker"
+}
+
+require_sandbox() {
+  [[ -n "${1:-}" ]] || die "missing sandbox name (see: claude-sandbox ls)"
+  [[ "$(docker container inspect -f '{{index .Config.Labels "claude-sandbox"}}' "$1" 2>/dev/null)" == 1 ]] \
+    || die "no sandbox named $1"
+}
+
+is_running() { [[ "$(docker container inspect -f '{{.State.Running}}' "$1")" == true ]]; }
+
+# Starts Claude in a detached tmux session, passing tokens in at launch so
+# they're never stored in the container's configuration.
+launch() {
+  local name=$1; shift
+  load_secret CLAUDE_CODE_OAUTH_TOKEN claude-oauth-token
+  load_secret GH_TOKEN claude-sandbox-github
+  [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || die "no Claude token found (see README: Login)"
+  local env=(-e CLAUDE_CODE_OAUTH_TOKEN)
+  [[ -n "${GH_TOKEN:-}" ]] && env+=(-e GH_TOKEN)
+  docker exec "${env[@]}" "$name" tmux new-session -d -s claude -x 200 -y 50 sandbox-claude "$@"
+}
+
+has_session() { docker exec "$1" tmux has-session -t claude 2>/dev/null; }
+
+# Moves .git between the workspace and a root-only folder Claude can't read.
+# $1 = sandbox, $2 = on|off|status.
+switch_git() {
+  docker exec -u root "$1" sh -c '
+    ws=$SANDBOX_WORKDIR; vault=/var/lib/sandbox-git
+    case $1 in
+      status)
+        if [ -d "$ws/.git" ]; then echo on; elif [ -d "$vault/.git" ]; then echo off; else echo "none (no .git)"; fi ;;
+      off)
+        [ -d "$ws/.git" ] || { [ -d "$vault/.git" ] && echo "git is already off" || echo "no .git folder in the workspace"; exit 1; } >&2
+        mkdir -p "$vault" && chmod 700 "$vault" && mv "$ws/.git" "$vault/.git" ;;
+      on)
+        [ -d "$vault/.git" ] || { [ -d "$ws/.git" ] && echo "git is already on" || echo "no hidden .git to restore"; exit 1; } >&2
+        [ ! -e "$ws/.git" ] || { echo "the workspace already has its own .git (e.g. from git init); remove it first"; exit 1; } >&2
+        mv "$vault/.git" "$ws/.git" ;;
+    esac' _ "$2"
+}
+
+label() { docker container inspect -f "{{index .Config.Labels \"claude-sandbox.$2\"}}" "$1"; }
+
+on_network() {
+  docker container inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$1" \
+    | tr ' ' '\n' | grep -qx "$2"
+}
+
+# Domains the offline proxy allows: Anthropic's API plus your allowlist file
+# (one per line, # comments, wildcards like *.github.com).
+allowlist() {
+  echo api.anthropic.com
+  [[ -f "$config_dir/allowlist" ]] && sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' "$config_dir/allowlist"
+  return 0
+}
+
+# Copies the allowlist into the offline proxy (which needn't be running).
+write_allowlist() {
+  local tmp
+  tmp="$(mktemp)"
+  allowlist > "$tmp"
+  chmod 644 "$tmp"
+  docker cp -q "$tmp" "$proxy_filtered:/etc/tinyproxy/allow"
+  rm -f "$tmp"
+}
+
+# Applies the current allowlist to the running offline proxy.
+sync_allowlist() {
+  write_allowlist
+  docker kill -s USR1 "$proxy_filtered" >/dev/null
+}
+
+# Creates the networks and proxies on first use and makes sure they're running.
+ensure_network() {
+  docker image inspect "$proxy_image" >/dev/null 2>&1 \
+    || docker build -q -t "$proxy_image" "$repo_dir/docker/proxy" >/dev/null
+  docker network inspect "$net_on" >/dev/null 2>&1 || docker network create "$net_on" >/dev/null
+  docker network inspect "$net_off" >/dev/null 2>&1 || docker network create --internal "$net_off" >/dev/null
+  if ! docker container inspect "$proxy_open" >/dev/null 2>&1; then
+    docker run -d --name "$proxy_open" --restart unless-stopped \
+      --network "$net_on" --network-alias proxy "$proxy_image" >/dev/null
+  fi
+  if ! docker container inspect "$proxy_filtered" >/dev/null 2>&1; then
+    docker create --name "$proxy_filtered" --restart unless-stopped \
+      --network "$net_on" -e FILTER=1 "$proxy_image" >/dev/null
+    docker network connect --alias proxy "$net_off" "$proxy_filtered"
+    write_allowlist
+  fi
+  docker start "$proxy_open" "$proxy_filtered" >/dev/null
+}
+
+# Prints the paths to copy from the current folder, NUL-separated: in a git
+# repo, the files git doesn't ignore plus .git; otherwise everything.
+list_files() {
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git ls-files -z --cached --others --exclude-standard | while IFS= read -r -d '' f; do
+      # Skip tracked files that were deleted but not yet committed.
+      if [[ -e "$f" || -L "$f" ]]; then printf '%s\0' "$f"; fi
+    done
+    if [[ -d .git ]]; then printf '.git\0'; fi
+  else
+    printf '.\0'
+  fi
+}
+
+cmd_new() {
+  local name="" from="$PWD" template=default mount=false git_off=false offline=false isolate=false
+  local cpus="${CLAUDE_SANDBOX_CPUS:-8}" memory="${CLAUDE_SANDBOX_MEMORY:-8g}"
+  if [[ $# -gt 0 && "$1" != -* ]]; then name=$1; shift; fi
+  while (($#)); do
+    case "$1" in
+      --from) from="${2:?--from needs a folder}"; shift 2 ;;
+      --template) template="${2:?--template needs a name or folder}"; shift 2 ;;
+      --mount) mount=true; shift ;;
+      --isolate) isolate=true; git_off=true; offline=true; shift ;;
+      --no-git) git_off=true; shift ;;
+      --offline) offline=true; shift ;;
+      --cpus) cpus="${2:?--cpus needs a number}"; shift 2 ;;
+      --memory) memory="${2:?--memory needs a size}"; shift 2 ;;
+      --) shift; break ;;
+      *) die "unknown option for new: $1" ;;
+    esac
+  done
+
+  # A mounted folder is the live real folder, which defeats isolation.
+  $isolate && $mount && die "--isolate can't be used with --mount"
+  local src template_dir
+  src="$(cd "$from" && pwd)" || die "no folder at $from"
+  if [[ "$template" == */* || "$template" == . ]]; then
+    template_dir="$(cd "$template" && pwd)" || die "no template folder at $template"
+  elif [[ -d "$config_dir/templates/$template" ]]; then
+    template_dir="$config_dir/templates/$template"
+  elif [[ -d "$repo_dir/templates/$template" ]]; then
+    template_dir="$repo_dir/templates/$template"
+  else
+    die "no template named $template in $config_dir/templates or $repo_dir/templates"
+  fi
+
+  if [[ -z "$name" ]]; then
+    local base n
+    base="$(basename "$src" | tr -c 'A-Za-z0-9_.\n-' '-')-sandbox"
+    for ((n = 1; n < 100; n++)); do
+      name="$base-$(printf %02d "$n")"
+      docker container inspect "$name" >/dev/null 2>&1 || break
+    done
+  fi
+  docker container inspect "$name" >/dev/null 2>&1 && die "a container named $name already exists"
+
+  local workdir="/workspace/$(basename "$src")"
+  local run=(-d --init --name "$name" --hostname "$name"
+    --cpus "$cpus" --memory "$memory" --memory-swap "$memory" --pids-limit 4096
+    --security-opt no-new-privileges
+    -e SANDBOX_WORKDIR="$workdir"
+    --network "$($offline && echo "$net_off" || echo "$net_on")"
+    -e HTTPS_PROXY="$proxy_url" -e HTTP_PROXY="$proxy_url"
+    -e https_proxy="$proxy_url" -e http_proxy="$proxy_url"
+    -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1
+    --label claude-sandbox=1
+    --label claude-sandbox.proxy=1
+    --label claude-sandbox.source="$src"
+    --label claude-sandbox.template="$template_dir"
+    --label claude-sandbox.workdir="$workdir"
+    --label claude-sandbox.mode="$($mount && echo mount || echo copy)")
+  $mount && run+=(-v "$src:$workdir")
+
+  ensure_image
+  ensure_network
+  docker run "${run[@]}" "$image" >/dev/null
+  # Remove the half-made sandbox if any setup step fails.
+  setup_ok=false
+  trap '$setup_ok || { docker rm -f "$name" >/dev/null 2>&1; echo "claude-sandbox: setup failed; removed $name" >&2; }' EXIT
+
+  (cd "$template_dir" && COPYFILE_DISABLE=1 tar -c --no-xattrs -f - .) \
+    | docker exec -i "$name" tar -x -f - -C /home/node/.claude
+  if ! $mount; then
+    local exclude=()
+    [[ -f "$src/.sandboxignore" ]] && exclude=(-X "$src/.sandboxignore")
+    docker exec "$name" mkdir -p "$workdir"
+    (cd "$src" && list_files \
+      | COPYFILE_DISABLE=1 tar -c --no-xattrs ${exclude[@]+"${exclude[@]}"} --null -T - -f -) \
+      | docker exec -i "$name" tar -x -f - -C "$workdir"
+    # Tracked files left out by .sandboxignore would look deleted to git, and
+    # a commit could delete them from the repo; tell git to leave them alone.
+    if ((${#exclude[@]})) && [[ -d "$src/.git" ]]; then
+      local deleted_on_host
+      deleted_on_host="$(git -C "$src" ls-files --deleted)"
+      docker exec -w "$workdir" "$name" git ls-files --deleted \
+        | { grep -vxF -e "$deleted_on_host" || true; } \
+        | docker exec -i -w "$workdir" "$name" git update-index --skip-worktree --stdin
+    fi
+  fi
+  local git_name git_email
+  git_name="$(git -C "$src" config user.name 2>/dev/null || git config --global user.name 2>/dev/null || true)"
+  git_email="$(git -C "$src" config user.email 2>/dev/null || git config --global user.email 2>/dev/null || true)"
+  [[ -n "$git_name" ]] && docker exec "$name" git config --global user.name "$git_name"
+  [[ -n "$git_email" ]] && docker exec "$name" git config --global user.email "$git_email"
+  docker exec "$name" sandbox-setup
+  if $git_off && ! $mount && [[ -d "$src/.git" ]]; then switch_git "$name" off; fi
+  launch "$name" "$@"
+  setup_ok=true
+
+  local git_state=none
+  if ! $mount && [[ -d "$src/.git" ]]; then git_state="$($git_off && echo off || echo on)"; fi
+  echo "Created $name (from $src, template $(basename "$template_dir"), internet $($offline && echo off || echo on), git $git_state)."
+  echo "Attach with: claude-sandbox attach $name"
+}
+
+cmd_attach() {
+  require_sandbox "${1:-}"
+  [[ "$(label "$1" proxy)" == 1 ]] && ensure_network
+  is_running "$1" || { echo "Starting $1..."; docker start "$1" >/dev/null; }
+  has_session "$1" || launch "$1"
+  exec docker exec -it "$1" tmux attach -d -t claude
+}
+
+cmd_start() {
+  require_sandbox "${1:-}"
+  [[ "$(label "$1" proxy)" == 1 ]] && ensure_network
+  docker start "$1" >/dev/null
+  has_session "$1" || launch "$1"
+  echo "Started $1. Attach with: claude-sandbox attach $1"
+}
+
+cmd_stop() {
+  require_sandbox "${1:-}"
+  docker stop "$1" >/dev/null
+  echo "Stopped $1. Resume with: claude-sandbox start $1"
+}
+
+cmd_ls() {
+  {
+    printf 'NAME\tSTATE\tINTERNET\tFILES\tSOURCE\tCREATED\n'
+    docker ps -a --filter label=claude-sandbox=1 --format \
+      '{{.Names}}\t{{.State}}\t{{if eq .Networks "claude-sandbox-offline"}}off{{else}}on{{end}}\t{{.Label "claude-sandbox.mode"}}\t{{.Label "claude-sandbox.source"}}\t{{.RunningFor}}'
+  } | column -t -s "$(printf '\t')"
+}
+
+cmd_shell() {
+  require_sandbox "${1:-}"
+  is_running "$1" || die "$1 is stopped (claude-sandbox start $1)"
+  exec docker exec -it "$1" sh -c 'cd "$SANDBOX_WORKDIR" && exec bash'
+}
+
+cmd_net() {
+  if [[ "${1:-}" == reload ]]; then
+    ensure_network
+    sync_allowlist
+    echo "Offline sandboxes may now reach:"; allowlist | sed 's/^/  /'
+    return
+  fi
+  local name="${1:-}" state="${2:-}"
+  require_sandbox "$name"
+  [[ "$(label "$name" proxy)" == 1 ]] || die "$name was created before internet switching existed; recreate it to use net"
+  case "$state" in
+    "")
+      on_network "$name" "$net_off" && echo off || echo on ;;
+    on)
+      ensure_network
+      on_network "$name" "$net_on" || docker network connect "$net_on" "$name"
+      on_network "$name" "$net_off" && docker network disconnect "$net_off" "$name"
+      echo "Internet on for $name." ;;
+    off)
+      ensure_network
+      sync_allowlist
+      on_network "$name" "$net_off" || docker network connect "$net_off" "$name"
+      on_network "$name" "$net_on" && docker network disconnect "$net_on" "$name"
+      echo "Internet off for $name (allowed: $(allowlist | paste -sd, - | sed 's/,/, /g'))." ;;
+    *) die "usage: claude-sandbox net NAME [on|off] | net reload" ;;
+  esac
+  return 0
+}
+
+cmd_git() {
+  local name="${1:-}" state="${2:-}"
+  require_sandbox "$name"
+  is_running "$name" || die "$name is stopped (claude-sandbox start $name)"
+  case "$state" in
+    "") switch_git "$name" status ;;
+    on|off)
+      [[ "$(label "$name" mode)" == mount ]] && die "$name uses your real folder (--mount); git can't be switched"
+      switch_git "$name" "$state" || exit 1
+      echo "Git $state for $name." ;;
+    *) die "usage: claude-sandbox git NAME [on|off]" ;;
+  esac
+}
+
+cmd_import() {
+  local name="${1:-}"; shift || true
+  require_sandbox "$name"
+  is_running "$name" || die "$name is stopped (claude-sandbox start $name)"
+  local to="" paths=()
+  while (($#)); do
+    case "$1" in
+      --to) to="${2:?--to needs a folder}"; shift 2 ;;
+      *) paths+=("$1"); shift ;;
+    esac
+  done
+  ((${#paths[@]})) || die "usage: claude-sandbox import NAME PATH... [--to DIR]"
+  local dest p
+  dest="$(label "$name" workdir)/$to"
+  for p in "${paths[@]}"; do
+    [[ -e "$p" ]] || die "no file or folder at $p"
+    (cd "$(dirname "$p")" && COPYFILE_DISABLE=1 tar -c --no-xattrs -f - "$(basename "$p")") \
+      | docker exec -i "$name" sh -c 'mkdir -p "$1" && tar -x -f - -C "$1"' _ "$dest"
+  done
+  echo "Imported into $dest"
+}
+
+cmd_export() {
+  local name="${1:-}"; shift || true
+  require_sandbox "$name"
+  local dest="" paths=()
+  while (($#)); do
+    case "$1" in
+      --to) dest="${2:?--to needs a folder}"; shift 2 ;;
+      *) paths+=("$1"); shift ;;
+    esac
+  done
+  dest="${dest:-./$name-export}"
+  [[ -e "$dest" ]] && die "$dest already exists"
+  local workdir
+  workdir="$(docker container inspect -f '{{index .Config.Labels "claude-sandbox.workdir"}}' "$name")"
+  mkdir -p "$dest"
+  if ((${#paths[@]} == 0)); then
+    docker cp -q "$name:$workdir/." "$dest"
+  else
+    local p
+    for p in "${paths[@]}"; do docker cp -q "$name:$workdir/$p" "$dest/"; done
+  fi
+  echo "Exported to $dest"
+}
+
+cmd_rm() {
+  local force=false
+  [[ "${1:-}" == -f ]] && { force=true; shift; }
+  require_sandbox "${1:-}"
+  if ! $force; then
+    read -r -p "Delete $1 and everything in it? [y/N] " reply
+    [[ "$reply" == [yY]* ]] || exit 0
+  fi
+  docker rm -f "$1" >/dev/null
+  echo "Removed $1"
+}
+
+case "${1:-help}" in
+  new) shift; cmd_new "$@" ;;
+  attach) shift; cmd_attach "$@" ;;
+  start) shift; cmd_start "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  ls) cmd_ls ;;
+  shell) shift; cmd_shell "$@" ;;
+  net) shift; cmd_net "$@" ;;
+  git) shift; cmd_git "$@" ;;
+  import) shift; cmd_import "$@" ;;
+  export) shift; cmd_export "$@" ;;
+  rm) shift; cmd_rm "$@" ;;
+  rebuild) docker build --pull --no-cache -t "$image" "$repo_dir/docker" ;;
+  help|-h|--help) usage ;;
+  --help-more|help-more) usage_more ;;
+  *) die "unknown command: $1 (see: claude-sandbox help)" ;;
+esac
