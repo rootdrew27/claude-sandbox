@@ -105,6 +105,17 @@ Run `claude-sandbox net reload` after editing it. Docker networking enforces thi
 
 A template is the starting `~/.claude` (`CLAUDE.md`, `settings.json`, skills, agents, ...). `--template NAME` looks in `~/.config/claude-sandbox/templates/`, then this repo's `templates/`. To make one, copy `templates/default` there and edit it. Changes apply to new sandboxes only.
 
+A template can also ask for secrets with a `secrets` file, one `VAR=keychain-item` per line (`#` comments allowed). At each launch, sandboxes made from it get `VAR` set from that Keychain item (or, without the Keychain, the file of that name in `~/.config/claude-sandbox/`). Only the names are stored in the container, and the file itself isn't copied into `~/.claude`. Other sandboxes never see these secrets.
+
+For Google APIs, store a service account's JSON key base64-encoded and name it `GOOGLE_SA_KEY_B64`:
+
+```sh
+security add-generic-password -U -a "$USER" -s my-google-key -w "$(base64 -i key.json)"
+echo 'GOOGLE_SA_KEY_B64=my-google-key' > ~/.config/claude-sandbox/templates/NAME/secrets
+```
+
+In the sandbox, `google-token [SCOPE...]` prints a one-hour access token (default scope: read-only Drive, or `$GOOGLE_SA_SCOPES`), e.g. `curl -H "Authorization: Bearer $(google-token)" https://www.googleapis.com/drive/v3/files`. The service account sees only files shared with it; share as Viewer to keep it read-only. Google's APIs need internet on.
+
 The `default` template turns permission prompts off and auto-compaction on, so unattended runs don't stall. It also denies pushing to `main`/`master`, force-pushing and merging PRs. That guards against mistakes, not determined workarounds such as calling the GitHub API with `curl`.
 
 Your own `~/.claude`, home folder and credentials are never in a sandbox.

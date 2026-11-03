@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Prints a Google OAuth access token for a service account.
+
+Usage: google-token [SCOPE...]
+
+The key is the service account's JSON key, base64-encoded, in
+$GOOGLE_SA_KEY_B64 (passed in at launch from a template's `secrets` file).
+Scopes default to $GOOGLE_SA_SCOPES, else read-only Drive. Tokens last an
+hour; run this again for a new one, e.g.
+    curl -H "Authorization: Bearer $(google-token)" https://www.googleapis.com/drive/v3/files
+The private key is handed to openssl through a pipe and never written to disk.
+"""
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DEFAULT_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def sign(message: bytes, private_key: str) -> bytes:
+    r, w = os.pipe()
+    os.write(w, private_key.encode())  # a key is ~1.7 KB, well under the pipe buffer
+    os.close(w)
+    try:
+        return subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{r}"],
+            input=message, capture_output=True, check=True, pass_fds=(r,),
+        ).stdout
+    finally:
+        os.close(r)
+
+
+def main() -> None:
+    encoded = os.environ.get("GOOGLE_SA_KEY_B64")
+    if not encoded:
+        sys.exit("google-token: GOOGLE_SA_KEY_B64 is not set; this sandbox has no Google key")
+    key = json.loads(base64.b64decode(encoded))
+    scopes = sys.argv[1:] or os.environ.get("GOOGLE_SA_SCOPES", DEFAULT_SCOPE).split()
+
+    now = int(time.time())
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    claims = b64url(json.dumps({
+        "iss": key["client_email"],
+        "scope": " ".join(scopes),
+        "aud": key["token_uri"],
+        "iat": now,
+        "exp": now + 3600,
+    }).encode())
+    unsigned = f"{header}.{claims}".encode()
+    assertion = f"{header}.{claims}.{b64url(sign(unsigned, key['private_key']))}"
+
+    body = urllib.parse.urlencode({
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": assertion,
+    }).encode()
+    try:
+        with urllib.request.urlopen(key["token_uri"], body, timeout=30) as resp:
+            print(json.load(resp)["access_token"])
+    except urllib.error.HTTPError as e:
+        sys.exit(f"google-token: {e.code} {e.read().decode(errors='replace')}")
+    except urllib.error.URLError as e:
+        sys.exit(f"google-token: can't reach Google ({e.reason}); is this sandbox's internet on?")
+
+
+if __name__ == "__main__":
+    main()
