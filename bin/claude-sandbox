@@ -113,18 +113,14 @@ launch() {
   for pair in $(label "$name" secrets); do
     var=${pair%%=*}
     load_secret "$var" "${pair#*=}"
-    if [[ -n "${!var:-}" ]]; then
-      env+=(-e "$var")
-    else
-      echo "claude-sandbox: warning: no secret ${pair#*=} found for $var; starting without it" >&2
-    fi
+    [[ -n "${!var:-}" ]] || echo "claude-sandbox: warning: no ${pair#*=} found; starting without $var" >&2
+    env+=(-e "$var")
   done
   docker exec "${env[@]}" "$name" tmux new-session -d -s claude -x 200 -y 50 sandbox-claude "$@"
 }
 
-# Prints the secrets a template asks for, from its `secrets` file, as
-# space-separated VAR=ITEM pairs: at each launch, VAR is set to the Keychain
-# item (or token file) ITEM. Only these names are stored in the container.
+# Prints the VAR=ITEM lines of a template's `secrets` file, space-separated.
+# Each launch sets VAR from the Keychain item (or token file) ITEM.
 template_secrets() {
   [[ -f "$1/secrets" ]] || return 0
   local line pairs=()
