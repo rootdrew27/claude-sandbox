@@ -4,13 +4,13 @@ FROM node:22-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl gh git less procps python3 ripgrep tmux \
+      ca-certificates curl gh git less openssl procps python3 ripgrep tmux \
  && rm -rf /var/lib/apt/lists/*
 
 # Owned by node so copied-in workspaces are writable.
 RUN mkdir /workspace && chown node:node /workspace
 
-COPY sandbox-setup sandbox-claude /usr/local/bin/
+COPY sandbox-setup sandbox-claude google-token /usr/local/bin/
 
 USER node
 WORKDIR /home/node

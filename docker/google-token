@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Prints a Google access token for the service account key in $GOOGLE_SA_KEY_B64.
+
+Usage: google-token [SCOPE...]      (default: Drive, Docs and Sheets)
+
+What the token can do is set by what's shared with the service account, and
+how (Viewer, Commenter, Editor). Google caps tokens at an hour, so run this for
+each request: curl -H "Authorization: Bearer $(google-token)" URL
+"""
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def sign(message: bytes, private_key: str) -> bytes:
+    # Hand the key to openssl through a pipe so it's never written to disk.
+    r, w = os.pipe()
+    os.write(w, private_key.encode())
+    os.close(w)
+    try:
+        return subprocess.run(["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{r}"],
+                              input=message, capture_output=True, check=True, pass_fds=(r,)).stdout
+    finally:
+        os.close(r)
+
+
+def main() -> None:
+    if not os.environ.get("GOOGLE_SA_KEY_B64"):
+        sys.exit("google-token: GOOGLE_SA_KEY_B64 is not set; this sandbox has no Google key")
+    key = json.loads(base64.b64decode(os.environ["GOOGLE_SA_KEY_B64"]))
+    scopes = sys.argv[1:] or ["https://www.googleapis.com/auth/drive"]
+
+    now = int(time.time())
+    claims = {"iss": key["client_email"], "scope": " ".join(scopes),
+              "aud": key["token_uri"], "iat": now, "exp": now + 3600}
+    unsigned = b64url(b'{"alg":"RS256","typ":"JWT"}') + "." + b64url(json.dumps(claims).encode())
+    jwt = unsigned + "." + b64url(sign(unsigned.encode(), key["private_key"]))
+
+    body = urllib.parse.urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                                   "assertion": jwt}).encode()
+    try:
+        with urllib.request.urlopen(key["token_uri"], body, timeout=30) as resp:
+            print(json.load(resp)["access_token"])
+    except urllib.error.HTTPError as e:
+        sys.exit(f"google-token: {e.code} {e.read().decode(errors='replace')}")
+    except urllib.error.URLError as e:
+        sys.exit(f"google-token: can't reach Google ({e.reason}); is this sandbox's internet on?")
+
+
+if __name__ == "__main__":
+    main()
