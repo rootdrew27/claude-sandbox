@@ -106,7 +106,7 @@ launch() {
   load_secret CLAUDE_CODE_OAUTH_TOKEN claude-oauth-token
   load_secret GH_TOKEN claude-sandbox-github
   [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || die "no Claude token found (see README: Login)"
-  local env=(-e CLAUDE_CODE_OAUTH_TOKEN)
+  local env=(-e CLAUDE_CODE_OAUTH_TOKEN -e LANG=C.UTF-8)
   [[ -n "${GH_TOKEN:-}" ]] && env+=(-e GH_TOKEN)
   docker exec "${env[@]}" "$name" tmux new-session -d -s claude -x 200 -y 50 sandbox-claude "$@"
 }
@@ -302,7 +302,7 @@ cmd_attach() {
   [[ "$(label "$1" proxy)" == 1 ]] && ensure_network
   is_running "$1" || { echo "Starting $1..."; docker start "$1" >/dev/null; }
   has_session "$1" || launch "$1"
-  exec docker exec -it "$1" tmux attach -d -t claude
+  exec docker exec -it -e LANG=C.UTF-8 "$1" tmux attach -d -t claude
 }
 
 cmd_start() {
@@ -330,7 +330,7 @@ cmd_ls() {
 cmd_shell() {
   require_sandbox "${1:-}"
   is_running "$1" || die "$1 is stopped (claude-sandbox start $1)"
-  exec docker exec -it "$1" sh -c 'cd "$SANDBOX_WORKDIR" && exec bash'
+  exec docker exec -it -e LANG=C.UTF-8 "$1" sh -c 'cd "$SANDBOX_WORKDIR" && exec bash'
 }
 
 cmd_net() {

@@ -1,6 +1,6 @@
 # claude-sandbox
 
-Run Claude Code in Docker containers. Each sandbox has its own copy of a folder and its own `~/.claude`, and lasts until you remove it. Claude runs in tmux, so you can close the terminal and come back later.
+Run Claude Code in Docker containers. Each sandbox has its own copy of a folder and its own `~/.claude`, and lasts until you remove it.
 
 - **Control context**: Claude sees only the files, `~/.claude`, git history and internet access you give it.
 - **Keep your machine clean**: whatever Claude installs or creates stays in the container.
@@ -72,7 +72,7 @@ claude-sandbox attach my-app-sandbox-01          # watch or steer; Ctrl-b d to l
 
 ### Files
 
-`new` copies `--from` once; nothing on your machine is mounted, so changes don't leak either way.
+`new` copies `--from` once (unless `--mount`), so changes don't leak either way.
 
 - In a git repo, it copies what git sees (tracked and new files, not ignored ones) plus `.git`.
 - Elsewhere, it copies the whole folder.
@@ -99,7 +99,7 @@ Run `claude-sandbox net reload` after editing it. Docker networking enforces thi
 
 ### Isolation
 
-`new --isolate` turns git and internet off, so Claude works only from the current files. Turn either back on when needed, e.g. `git NAME on` and `net NAME on` to let Claude push.
+`new --isolate` turns git and internet off, so Claude works only from the current files. Turn either back on with `git NAME on` or `net NAME on`, e.g. to let Claude push.
 
 ### Templates
 

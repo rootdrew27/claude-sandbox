@@ -29,7 +29,9 @@ RUN git config --global credential.https://github.com.helper '!gh auth git-crede
 RUN printf 'set -g mouse on\nset -g focus-events on\n' > /home/node/.tmux.conf
 
 # Keep all Claude state in ~/.claude. No self-updates; use `rebuild`.
+# A UTF-8 locale, or tmux shows non-ASCII characters as "_".
 ENV PATH="/home/node/.local/bin:${PATH}" \
+    LANG=C.UTF-8 \
     CLAUDE_CONFIG_DIR=/home/node/.claude \
     DISABLE_AUTOUPDATER=1
 
