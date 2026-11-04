@@ -115,7 +115,7 @@ Your own `~/.claude`, home folder and credentials are never in a sandbox.
 
 Store a GitHub token as `claude-sandbox-github`, the same way as the Claude token. Use a fine-grained token limited to the repos you want, with Contents: read and write.
 
-Tokens are passed in each time Claude launches and never stored in the container's configuration.
+Tokens are passed in each time Claude launches and never stored in the container's configuration. `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` and template secrets (such as `GOOGLE_SA_KEY_B64`), if set in your environment, take priority over the Keychain.
 
 ## Google Drive
 
@@ -131,7 +131,7 @@ security add-generic-password -U -a "$USER" -s my-google-key \
 echo 'GOOGLE_SA_KEY_B64=my-google-key' > ~/.config/claude-sandbox/templates/NAME/secrets
 ```
 
-In the sandbox, `google-token` turns the key into an access token: `curl -H "Authorization: Bearer $(google-token)" https://www.googleapis.com/drive/v3/files`. Google caps tokens at an hour, so get one per request; the key itself lasts as long as the sandbox. Drive needs internet on. To revoke access, unshare the files or delete the key. `CLAUDE_CODE_OAUTH_TOKEN` and `GH_TOKEN`, if set in your environment, take priority.
+In the sandbox, `google-token` turns the key into an access token: `curl -H "Authorization: Bearer $(google-token)" https://www.googleapis.com/drive/v3/files`. Google caps tokens at an hour, so get one per request; the key itself lasts as long as the sandbox. Drive needs internet on. To revoke access, unshare the files or delete the key.
 
 ## Configuration
 
