@@ -108,7 +108,28 @@ launch() {
   [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || die "no Claude token found (see README: Login)"
   local env=(-e CLAUDE_CODE_OAUTH_TOKEN -e LANG=C.UTF-8)
   [[ -n "${GH_TOKEN:-}" ]] && env+=(-e GH_TOKEN)
+  # Secrets the sandbox's template asked for (see template_secrets).
+  local pair var
+  for pair in $(label "$name" secrets); do
+    var=${pair%%=*}
+    load_secret "$var" "${pair#*=}"
+    [[ -n "${!var:-}" ]] || echo "claude-sandbox: warning: no ${pair#*=} found; starting without $var" >&2
+    env+=(-e "$var")
+  done
   docker exec "${env[@]}" "$name" tmux new-session -d -s claude -x 200 -y 50 sandbox-claude "$@"
+}
+
+# Prints the VAR=ITEM lines of a template's `secrets` file, space-separated.
+# Each launch sets VAR from the Keychain item (or token file) ITEM.
+template_secrets() {
+  [[ -f "$1/secrets" ]] || return 0
+  local line pairs=()
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_.-]+$ ]] \
+      || die "bad line in $1/secrets: $line (expected VAR=keychain-item)"
+    pairs+=("$line")
+  done < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' "$1/secrets")
+  echo ${pairs[@]+"${pairs[@]}"}
 }
 
 has_session() { docker exec "$1" tmux has-session -t claude 2>/dev/null; }
@@ -227,6 +248,8 @@ cmd_new() {
   else
     die "no template named $template in $config_dir/templates or $repo_dir/templates"
   fi
+  local secrets
+  secrets="$(template_secrets "$template_dir")"
 
   if [[ -z "$name" ]]; then
     local base n
@@ -251,6 +274,7 @@ cmd_new() {
     --label claude-sandbox.proxy=1
     --label claude-sandbox.source="$src"
     --label claude-sandbox.template="$template_dir"
+    --label claude-sandbox.secrets="$secrets"
     --label claude-sandbox.workdir="$workdir"
     --label claude-sandbox.mode="$($mount && echo mount || echo copy)")
   $mount && run+=(-v "$src:$workdir")
@@ -262,7 +286,7 @@ cmd_new() {
   setup_ok=false
   trap '$setup_ok || { docker rm -f "$name" >/dev/null 2>&1; echo "claude-sandbox: setup failed; removed $name" >&2; }' EXIT
 
-  (cd "$template_dir" && COPYFILE_DISABLE=1 tar -c --no-xattrs -f - .) \
+  (cd "$template_dir" && COPYFILE_DISABLE=1 tar -c --no-xattrs --exclude ./secrets -f - .) \
     | docker exec -i "$name" tar -x -f - -C /home/node/.claude
   if ! $mount; then
     local exclude=()
