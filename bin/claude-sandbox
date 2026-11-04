@@ -26,8 +26,9 @@
 #       --isolate        Start with git and internet off; can't be used with --mount
 #       --no-git         Start with git off
 #       --offline        Start with internet off
-#       --mount          Use the real folder live instead of a copy
-#       --cpus N         CPU limit (default 8)
+#       --mount          Use the real folder live instead of a copy (on Linux,
+#                        Claude runs as uid 1000 and needs write access)
+#       --cpus N         CPU limit (default 8, or all CPUs if fewer)
 #       --memory SIZE    Memory limit, e.g. 4g (default 8g)
 #   attach NAME          Open Claude (Ctrl-b d or close the tab to leave)
 #   code NAME            Open the workspace in VS Code (its own instance, over ssh)
@@ -225,7 +226,7 @@ list_files() {
 
 cmd_new() {
   local name="" from="$PWD" template=default mount=false git_off=false offline=false isolate=false
-  local cpus="${CLAUDE_SANDBOX_CPUS:-8}" memory="${CLAUDE_SANDBOX_MEMORY:-8g}"
+  local cpus="${CLAUDE_SANDBOX_CPUS:-}" memory="${CLAUDE_SANDBOX_MEMORY:-8g}"
   if [[ $# -gt 0 && "$1" != -* ]]; then name=$1; shift; fi
   while (($#)); do
     case "$1" in
@@ -268,6 +269,14 @@ cmd_new() {
   fi
   docker container inspect "$name" >/dev/null 2>&1 && die "a container named $name already exists"
 
+  # Default to 8 CPUs, or all of them if fewer: Docker refuses more than it has.
+  if [[ -z "$cpus" ]]; then
+    local host_cpus
+    cpus=8
+    host_cpus="$(docker info -f '{{.NCPU}}' 2>/dev/null)" || true
+    if [[ "$host_cpus" =~ ^[0-9]+$ ]] && ((host_cpus > 0 && host_cpus < cpus)); then cpus=$host_cpus; fi
+  fi
+
   local workdir="/workspace/$(basename "$src")"
   local run=(-d --init --name "$name" --hostname "$name"
     --cpus "$cpus" --memory "$memory" --memory-swap "$memory" --pids-limit 4096
@@ -295,6 +304,11 @@ cmd_new() {
 
   (cd "$template_dir" && COPYFILE_DISABLE=1 tar -c --no-xattrs --exclude ./secrets -f - .) \
     | docker exec -i "$name" tar -x -f - -C /home/node/.claude
+  # Claude runs as uid 1000. Docker on macOS remaps file owners; on Linux it
+  # doesn't, so a folder owned by another uid is read-only to Claude.
+  if $mount && ! docker exec "$name" test -w "$workdir"; then
+    echo "claude-sandbox: warning: Claude can't write to $src: it runs as uid 1000 in the sandbox, and your uid is $(id -u). Use a copy (no --mount), or make the folder writable by uid 1000." >&2
+  fi
   if ! $mount; then
     local exclude=()
     [[ -f "$src/.sandboxignore" ]] && exclude=(-X "$src/.sandboxignore")

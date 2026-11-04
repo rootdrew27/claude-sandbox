@@ -63,8 +63,8 @@ claude-sandbox attach my-app-sandbox-01          # watch or steer; Ctrl-b d to l
 | `--isolate` | | Start with git and internet off |
 | `--no-git` | | Start with git off |
 | `--offline` | | Start with internet off |
-| `--mount` | | Use the real folder live instead of a copy (not with `--isolate`) |
-| `--cpus N` | `8` | CPU limit |
+| `--mount` | | Use the real folder live instead of a copy (not with `--isolate`). On Linux, Claude runs as uid 1000, so the folder must be writable by that uid |
+| `--cpus N` | `8`, or all CPUs if fewer | CPU limit |
 | `--memory SIZE` | `8g` | Memory limit; processes that exceed it are killed |
 
 `claude-sandbox --help` lists the common commands; `--help-more` lists everything.
