@@ -42,6 +42,7 @@ claude-sandbox attach my-app-sandbox-01          # watch or steer; Ctrl-b d to l
 |---|---|
 | `new [NAME] [options] [-- claude args]` | Create a sandbox and start Claude. `NAME` defaults to `<folder>-sandbox-NN` |
 | `attach NAME` | Open Claude. Ctrl-b d or closing the terminal leaves it running |
+| `code NAME` | Open the workspace in VS Code (see [VS Code](#vs-code)) |
 | `stop NAME` / `start NAME` | Shut down / boot again; Claude resumes the conversation |
 | `ls` | List sandboxes |
 | `rm [-f] NAME` | Delete a sandbox and everything in it |
@@ -110,6 +111,14 @@ A template can also list secrets in a `secrets` file, one `VAR=keychain-item` pe
 The `default` template turns permission prompts off and auto-compaction on, so unattended runs don't stall. It also denies pushing to `main`/`master`, force-pushing and merging PRs. That guards against mistakes, not determined workarounds such as calling the GitHub API with `curl`.
 
 Your own `~/.claude`, home folder and credentials are never in a sandbox.
+
+## VS Code
+
+`claude-sandbox code NAME` opens the workspace in VS Code, to watch or edit files and notebooks while Claude works. It needs VS Code's `code` command (*Shell Command: Install 'code' command in PATH*) and a sandbox made after `claude-sandbox rebuild`.
+
+It uses its own VS Code instance (`~/.config/claude-sandbox/vscode/`), with separate settings, extensions and sign-ins, connected by Remote-SSH over `docker exec`: no ports, and it works with internet off, as your Mac fetches VS Code's server and extensions. Your SSH agent, git credentials, sign-ins, tokens and Claude's ports aren't forwarded, and nothing is forwarded from the sandbox to your Mac. But while VS Code is connected, programs in the sandbox can likely make it open a URL on your Mac.
+
+Its `data/User/settings.json` is written once; edit it freely. To run notebook cells, add a kernel: VS Code's *Create a Python Environment*, or `python3 -m venv .venv && .venv/bin/pip install ipykernel`. With internet off, allowlist `pypi.org` and `*.pythonhosted.org` first.
 
 ## Pushing to GitHub
 

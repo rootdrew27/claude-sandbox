@@ -1,0 +1,21 @@
+#!/bin/sh
+# Run by `claude-sandbox _ssh-proxy` via docker exec, as node: one sshd session
+# over stdin/stdout, so nothing listens on the network. $1 is the public key
+# allowed to log in.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+keys=/home/node/.sandbox-ssh/authorized_keys
+
+# Temp file and mv, as VS Code may connect several times at once.
+umask 077
+printf '%s\n' "$1" > "$keys.$$" && mv "$keys.$$" "$keys" || exit 1
+umask 022
+
+# sshd clears the session's environment; pass on the container's (proxy,
+# workdir, ...) in one SetEnv, as sshd keeps only the first.
+env='"PATH=/home/node/.local/bin:/usr/local/bin:/usr/bin:/bin"'
+for v in SANDBOX_WORKDIR CLAUDE_CONFIG_DIR LANG HTTPS_PROXY HTTP_PROXY https_proxy http_proxy NO_PROXY no_proxy; do
+  eval "val=\${$v-}"
+  case $val in *'"'*) continue ;; esac   # can't be quoted in sshd's config
+  [ -n "$val" ] && env="$env \"$v=$val\""
+done
+exec /usr/sbin/sshd -i -f /etc/ssh/sandbox_sshd_config -o "SetEnv $env"
