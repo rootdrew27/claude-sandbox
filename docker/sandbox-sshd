@@ -1,0 +1,35 @@
+#!/bin/sh
+# The ssh server behind `claude-sandbox code`. Its ssh ProxyCommand runs this
+# with docker exec, as node: one sshd session over stdin/stdout, so nothing
+# listens on the network. $1 is the public key allowed to log in.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+dir=/home/node/.sandbox-ssh
+
+# Private files, written to temp names and moved into place, since VS Code
+# may open several connections at once. The umask stays in this subshell, so
+# the session (and files you make from VS Code) gets the usual 022.
+(
+  umask 077
+  mkdir -p "$dir" || exit 1
+  if [ ! -f "$dir/host_key" ]; then
+    rm -f "$dir/host_key.$$" "$dir/host_key.$$.pub"
+    ssh-keygen -q -t ed25519 -N '' -C sandbox -f "$dir/host_key.$$" </dev/null || exit 1
+    rm -f "$dir/host_key.$$.pub"
+    mv "$dir/host_key.$$" "$dir/host_key" || exit 1
+  fi
+  if [ "$(cat "$dir/authorized_keys" 2>/dev/null)" != "$1" ]; then
+    printf '%s\n' "$1" > "$dir/authorized_keys.$$" \
+      && mv "$dir/authorized_keys.$$" "$dir/authorized_keys" || exit 1
+  fi
+) || exit 1
+umask 022
+
+# sshd gives the session a clean environment; pass on the container's own
+# (proxy, workdir, ...). It keeps only the first SetEnv, so build one.
+env='"PATH=/home/node/.local/bin:/usr/local/bin:/usr/bin:/bin"'
+for v in SANDBOX_WORKDIR CLAUDE_CONFIG_DIR LANG HTTPS_PROXY HTTP_PROXY https_proxy http_proxy NO_PROXY no_proxy; do
+  eval "val=\${$v-}"
+  case $val in *'"'*) continue ;; esac   # can't be quoted in sshd's config
+  [ -n "$val" ] && env="$env \"$v=$val\""
+done
+exec /usr/sbin/sshd -i -f /etc/ssh/sandbox_sshd_config -o "SetEnv $env"

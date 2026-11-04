@@ -42,6 +42,7 @@ claude-sandbox attach my-app-sandbox-01          # watch or steer; Ctrl-b d to l
 |---|---|
 | `new [NAME] [options] [-- claude args]` | Create a sandbox and start Claude. `NAME` defaults to `<folder>-sandbox-NN` |
 | `attach NAME` | Open Claude. Ctrl-b d or closing the terminal leaves it running |
+| `code NAME` | Open the workspace in VS Code (see [VS Code](#vs-code)) |
 | `stop NAME` / `start NAME` | Shut down / boot again; Claude resumes the conversation |
 | `ls` | List sandboxes |
 | `rm [-f] NAME` | Delete a sandbox and everything in it |
@@ -110,6 +111,19 @@ A template can also list secrets in a `secrets` file, one `VAR=keychain-item` pe
 The `default` template turns permission prompts off and auto-compaction on, so unattended runs don't stall. It also denies pushing to `main`/`master`, force-pushing and merging PRs. That guards against mistakes, not determined workarounds such as calling the GitHub API with `curl`.
 
 Your own `~/.claude`, home folder and credentials are never in a sandbox.
+
+## VS Code
+
+`claude-sandbox code NAME` opens the sandbox's workspace in VS Code, so you can watch files and notebooks change as Claude works, or edit them yourself. It needs VS Code's `code` command (in VS Code: *Shell Command: Install 'code' command in PATH*) and a sandbox made after this feature (`claude-sandbox rebuild`, then `new`).
+
+It opens a separate VS Code instance, kept in `~/.config/claude-sandbox/vscode/`, with its own settings, extensions and sign-ins. That instance connects with Remote-SSH, but over `docker exec` rather than the network: nothing listens on a port, and it works the same with internet on or off. With internet off, your Mac downloads VS Code's server and extensions and passes them in.
+
+What reaches the sandbox from your Mac, and what doesn't:
+
+- Not forwarded: your SSH agent, git credentials, GitHub sign-in, Claude and GitHub tokens, and the ports Claude opens. The ssh connection can't forward anything from the sandbox to your Mac.
+- Still possible while VS Code is connected: through VS Code itself, programs in the sandbox can ask your Mac to open a URL, and you'll see what VS Code shows you (for example, notebook output).
+
+Its settings (`~/.config/claude-sandbox/vscode/data/User/settings.json`) are written once, with the Jupyter and Python extensions installed in each sandbox, so edit them freely. To run notebook cells, give the project a kernel: VS Code's *Create a Python Environment* prompt works, as does `python3 -m venv .venv && .venv/bin/pip install ipykernel`. With internet off, allowlist `pypi.org` and `*.pythonhosted.org` first.
 
 ## Pushing to GitHub
 

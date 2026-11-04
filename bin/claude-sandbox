@@ -5,6 +5,7 @@
 #
 #   new [NAME] [--isolate] [-- PROMPT]   Create a sandbox from a copy of this folder
 #   attach NAME                          Open Claude (Ctrl-b d or close the tab to leave)
+#   code NAME                            Open the workspace in VS Code
 #   stop | start NAME                    Shut down / boot again and resume
 #   ls                                   List sandboxes
 #   rm [-f] NAME                         Delete a sandbox and everything in it
@@ -29,6 +30,8 @@
 #       --cpus N         CPU limit (default 8)
 #       --memory SIZE    Memory limit, e.g. 4g (default 8g)
 #   attach NAME          Open Claude (Ctrl-b d or close the tab to leave)
+#   code NAME            Open the workspace in VS Code (over ssh, in a separate
+#                        VS Code instance that forwards nothing from your Mac)
 #   stop NAME            Shut down; files and conversation are kept
 #   start NAME           Boot again and resume the conversation
 #   ls                   List sandboxes
@@ -66,6 +69,11 @@ proxy_image=claude-sandbox-proxy
 proxy_open=claude-sandbox-proxy
 proxy_filtered=claude-sandbox-proxy-offline
 proxy_url=http://proxy:8888
+
+# `code` opens sandboxes in a separate VS Code instance (its own settings,
+# extensions and sign-ins), connected by Remote-SSH through `_ssh-proxy`.
+vscode_dir="$config_dir/vscode"
+ssh_dir="$config_dir/ssh"
 
 die() { echo "claude-sandbox: $*" >&2; exit 1; }
 
@@ -357,6 +365,131 @@ cmd_shell() {
   exec docker exec -it -e LANG=C.UTF-8 "$1" sh -c 'cd "$SANDBOX_WORKDIR" && exec bash'
 }
 
+json_str() { local s=${1//\\/\\\\}; printf '"%s"' "${s//\"/\\\"}"; }
+
+# Sets up the VS Code instance `code` uses and sets the vscode array to the
+# command that runs it. Nothing in it is per sandbox.
+ensure_vscode() {
+  command -v code >/dev/null \
+    || die "no 'code' command (in VS Code: Shell Command: Install 'code' command in PATH)"
+  vscode=(code --user-data-dir "$vscode_dir/data" --extensions-dir "$vscode_dir/extensions")
+
+  # A key just for sandboxes; never your own.
+  if [[ ! -f "$ssh_dir/id_ed25519" ]]; then
+    mkdir -p "$ssh_dir" && chmod 700 "$ssh_dir"
+    ssh-keygen -q -t ed25519 -N '' -C claude-sandbox -f "$ssh_dir/id_ed25519"
+  fi
+  # Kept up to date so it follows this script if the repo moves; replaced
+  # atomically, as VS Code may be reading it to reconnect. The transport is
+  # docker exec, so there's no host key worth checking.
+  cat > "$ssh_dir/config.$$" <<EOF
+# Written by claude-sandbox code; used only by its VS Code instance.
+Host *
+  User node
+  ProxyCommand "$(readlink -f "${BASH_SOURCE[0]}")" _ssh-proxy %n
+  IdentityFile "$ssh_dir/id_ed25519"
+  IdentitiesOnly yes
+  ForwardAgent no
+  ForwardX11 no
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+EOF
+  if cmp -s "$ssh_dir/config.$$" "$ssh_dir/config"; then
+    rm -f "$ssh_dir/config.$$"
+  else
+    mv "$ssh_dir/config.$$" "$ssh_dir/config"
+  fi
+
+  # Written once; edit it freely afterwards.
+  local settings="$vscode_dir/data/User/settings.json"
+  if [[ ! -f "$settings" ]]; then
+    mkdir -p "$(dirname "$settings")"
+    cat > "$settings" <<EOF
+{
+  "remote.SSH.configFile": $(json_str "$ssh_dir/config"),
+  "remote.SSH.remotePlatform": { "*": "linux" },
+  "remote.SSH.enableAgentForwarding": false,
+  "remote.SSH.enableX11Forwarding": false,
+  "remote.SSH.defaultExtensions": ["ms-toolsai.jupyter", "ms-python.python"],
+  "remote.downloadExtensionsLocally": true,
+  "remote.autoForwardPorts": false,
+  "git.terminalAuthentication": false,
+  "github.gitAuthentication": false,
+  "chat.disableAIFeatures": true,
+  "workbench.startupEditor": "none"
+}
+EOF
+  fi
+  compgen -G "$vscode_dir/extensions/ms-vscode-remote.remote-ssh-[0-9]*" >/dev/null \
+    || "${vscode[@]}" --install-extension ms-vscode-remote.remote-ssh >/dev/null 2>&1 \
+    || die "couldn't install VS Code's Remote-SSH extension"
+}
+
+# Puts the VS Code CLI matching your VS Code into the sandbox, so Remote-SSH
+# needn't download it there or copy it in (which works offline, but has
+# stalled). Best effort: Remote-SSH does it itself if this doesn't.
+seed_vscode_cli() {
+  local name=$1 commit arch cache
+  commit="$(code --version 2>/dev/null | sed -n 2p)"
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || return 0
+  docker exec "$name" test -x "/home/node/.vscode-server/code-$commit" && return 0
+  case "$(docker exec "$name" uname -m)" in
+    aarch64|arm64) arch=arm64 ;;
+    x86_64) arch=x64 ;;
+    *) return 0 ;;
+  esac
+  cache="$vscode_dir/cache/vscode-cli-$commit-$arch.tar.gz"
+  if [[ ! -f "$cache" ]]; then
+    mkdir -p "$vscode_dir/cache"
+    rm -f "$vscode_dir"/cache/vscode-cli-*   # older VS Code versions
+    curl -fsSL --connect-timeout 10 --max-time 120 -o "$cache.part" "https://update.code.visualstudio.com/commit:$commit/cli-alpine-$arch/stable" \
+      && mv "$cache.part" "$cache" \
+      || { rm -f "$cache.part"; return 0; }
+  fi
+  docker exec -i "$name" sh -c 'umask 077; d=$HOME/.vscode-server
+    mkdir -p "$d" && tar -xzf - -O code > "$d/code-$1.part" \
+      && chmod 755 "$d/code-$1.part" && mv "$d/code-$1.part" "$d/code-$1"' _ "$commit" < "$cache" \
+    || true
+}
+
+cmd_code() {
+  local name="${1:-}"
+  require_sandbox "$name"
+  ensure_vscode
+  [[ "$(label "$name" proxy)" == 1 ]] && ensure_network
+  if ! is_running "$name"; then
+    echo "Starting $name..."
+    docker start "$name" >/dev/null
+    # In a subshell, so the secrets launch loads stay out of VS Code's
+    # environment; VS Code doesn't need Claude, so carry on without it.
+    has_session "$name" || ( launch "$name" ) \
+      || echo "claude-sandbox: warning: Claude isn't running in $name (claude-sandbox attach $name)" >&2
+  fi
+  docker exec "$name" test -x /usr/local/sbin/sandbox-sshd \
+    || die "$name was made from an image without code support; run claude-sandbox rebuild and make a new sandbox"
+  seed_vscode_cli "$name"
+  # Keep your SSH agent, tokens and the template's secrets out of VS Code's
+  # environment. On macOS this has no effect when it starts VS Code: VS Code
+  # gets your login environment instead. Either way, what keeps the agent
+  # from being forwarded is the ssh config, VS Code's settings and sshd.
+  local unset=(-u SSH_AUTH_SOCK -u GH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN) pair
+  for pair in $(label "$name" secrets); do unset+=(-u "${pair%%=*}"); done
+  # Remote-SSH's hex form keeps the name's case: URI authorities don't.
+  local host
+  host="$(printf '{"hostName":"%s"}' "$name" | od -An -tx1 | tr -d ' \n')"
+  env "${unset[@]}" "${vscode[@]}" --remote "ssh-remote+$host" "$(label "$name" workdir)"
+  echo "Opened $name in VS Code."
+}
+
+# The ssh ProxyCommand for `code`: one sshd session in the sandbox over
+# docker exec's stdin/stdout.
+cmd_ssh_proxy() {
+  require_sandbox "${1:-}"
+  is_running "$1" || die "$1 is stopped (claude-sandbox start $1)"
+  exec docker exec -i "$1" /usr/local/sbin/sandbox-sshd "$(<"$ssh_dir/id_ed25519.pub")"
+}
+
 cmd_net() {
   if [[ "${1:-}" == reload ]]; then
     ensure_network
@@ -461,6 +594,8 @@ cmd_rm() {
 case "${1:-help}" in
   new) shift; cmd_new "$@" ;;
   attach) shift; cmd_attach "$@" ;;
+  code) shift; cmd_code "$@" ;;
+  _ssh-proxy) shift; cmd_ssh_proxy "$@" ;;
   start) shift; cmd_start "$@" ;;
   stop) shift; cmd_stop "$@" ;;
   ls) cmd_ls ;;

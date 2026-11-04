@@ -4,13 +4,21 @@ FROM node:22-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl gh git less openssl procps python3 ripgrep tmux \
- && rm -rf /var/lib/apt/lists/*
+      ca-certificates curl gh git less openssh-server openssl procps python3 \
+      python3-venv \
+      ripgrep tmux \
+ && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_*
 
 # Owned by node so copied-in workspaces are writable.
 RUN mkdir /workspace && chown node:node /workspace
 
 COPY sandbox-setup sandbox-claude google-token /usr/local/bin/
+
+# `claude-sandbox code`: sshd runs per connection as node (see sandbox-sshd).
+# sshd refuses locked accounts; '*' unlocks node without giving it a password.
+COPY sandbox-sshd /usr/local/sbin/
+COPY sandbox_sshd_config /etc/ssh/
+RUN usermod -p '*' node
 
 USER node
 WORKDIR /home/node

@@ -1,0 +1,23 @@
+# sshd config for `claude-sandbox code` (run by sandbox-sshd as node, one
+# session per connection). Root-owned so Claude can't change it. What really
+# keeps channels from opening back to your Mac is the Mac-side ssh config,
+# which never asks for them; these settings are a second line.
+HostKey /home/node/.sandbox-ssh/host_key
+AuthorizedKeysFile /home/node/.sandbox-ssh/authorized_keys
+PidFile none
+AllowUsers node
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+PermitUserEnvironment no
+PrintMotd no
+# VS Code forwards from your Mac into the sandbox (local); nothing may
+# forward the other way.
+AllowTcpForwarding local
+AllowStreamLocalForwarding local
+GatewayPorts no
+AllowAgentForwarding no
+X11Forwarding no
+PermitTunnel no
+Subsystem sftp internal-sftp
