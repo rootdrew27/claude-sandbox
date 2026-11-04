@@ -1,0 +1,16 @@
+# For sandbox-sshd. Root-owned, so Claude can't change it, but only a second
+# line: the Mac-side ssh config never asks for channels back to the Mac.
+HostKey /home/node/.sandbox-ssh/host_key
+AuthorizedKeysFile /home/node/.sandbox-ssh/authorized_keys
+PidFile none
+AllowUsers node
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+# Forwarding only from the Mac into the sandbox.
+AllowTcpForwarding local
+AllowStreamLocalForwarding local
+AllowAgentForwarding no
+X11Forwarding no
+PermitTunnel no
+Subsystem sftp internal-sftp
